@@ -1,0 +1,320 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { createClient } from '@supabase/supabase-js';
+import Uppy from 'https://releases.transloadit.com/uppy/v3.6.1/uppy.min.mjs';
+import Tus from 'https://releases.transloadit.com/uppy/v3.6.1/uppy-tus/v3.4.0/uppy-tus.min.mjs';
+import { Dashboard } from 'https://releases.transloadit.com/uppy/v3.6.1/uppy-dashboard/v3.5.1/uppy-dashboard.min.mjs';
+import 'https://releases.transloadit.com/uppy/v3.6.1/uppy.min.css';
+
+// URL de um vídeo de placeholder, caso o usuário não forneça um URL válido.
+const fallbackVideoUrl = 'https://www.youtube.com/embed/dQw4w9WgXcQ';
+
+// Função para gerar QR Code (usando um SVG simples)
+const generateQRCodeSVG = (url) => {
+  const size = 256;
+  const qrCodeData = "https://api.qrserver.com/v1/create-qr-code/?size=256x256&data=" + encodeURIComponent(url);
+  return (
+    <img
+      src={qrCodeData}
+      alt="QR Code"
+      className="w-64 h-64 mx-auto rounded-lg shadow-lg"
+    />
+  );
+};
+
+// Componente principal do aplicativo
+const App = () => {
+  const [supabase, setSupabase] = useState(null);
+  const [posts, setPosts] = useState([]);
+  const [fact, setFact] = useState('');
+  const [videoUrl, setVideoUrl] = useState('');
+  const [uploadedImageUrl, setUploadedImageUrl] = useState(null);
+  const [qrCodeData, setQrCodeData] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+  const [isUploading, setIsUploading] = useState(false);
+  const uppyRef = useRef(null);
+  const dashboardRef = useRef(null);
+
+  // Variáveis do Supabase (substitua pelos seus valores)
+  const SUPABASE_PROJECT_ID = 'your-project-id';
+  const SUPABASE_ANON_KEY = 'your-anon-key';
+  const STORAGE_BUCKET = 'your-storage-bucket-name';
+  
+  const supabaseUrl = `https://${SUPABASE_PROJECT_ID}.supabase.co`;
+
+  // Função para extrair o ID do YouTube de um URL
+  const getYouTubeId = (url) => {
+    const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
+    const match = url.match(regExp);
+    return (match && match[2].length === 11) ? match[2] : null;
+  };
+
+  // Inicialização do Supabase e subscrição a atualizações em tempo real
+  useEffect(() => {
+    const initializeSupabase = async () => {
+      if (!SUPABASE_PROJECT_ID || !SUPABASE_ANON_KEY || !STORAGE_BUCKET) {
+        console.error("Please provide your Supabase credentials.");
+        setIsLoading(false);
+        return;
+      }
+      const supabaseClient = createClient(supabaseUrl, SUPABASE_ANON_KEY);
+      setSupabase(supabaseClient);
+
+      // Busca os posts iniciais
+      let { data, error } = await supabaseClient.from('event_posts').select('*').order('created_at', { ascending: false });
+      if (error) {
+        console.error("Error fetching initial posts:", error);
+      } else {
+        setPosts(data);
+      }
+
+      // Configura o listener em tempo real
+      const channel = supabaseClient
+        .channel('realtime_posts')
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'event_posts' }, (payload) => {
+          console.log('Change received!', payload);
+          setPosts((currentPosts) => [payload.new, ...currentPosts]);
+        })
+        .subscribe();
+
+      // Gera o QR Code
+      if (window.location.href) {
+        setQrCodeData(window.location.href);
+      }
+      setIsLoading(false);
+      
+      return () => {
+        supabaseClient.removeChannel(channel);
+      };
+    };
+    initializeSupabase();
+  }, [supabaseUrl, SUPABASE_ANON_KEY, STORAGE_BUCKET]);
+
+  // Inicialização do UppyJS
+  useEffect(() => {
+    if (!SUPABASE_PROJECT_ID || !SUPABASE_ANON_KEY || !STORAGE_BUCKET) return;
+    
+    uppyRef.current = new Uppy({
+      restrictions: {
+        maxNumberOfFiles: 1,
+        allowedFileTypes: ['image/*'],
+      }
+    })
+      .use(Dashboard, {
+        target: dashboardRef.current,
+        inline: true,
+        trigger: '#uppy-trigger',
+        hideUploadButton: true,
+      })
+      .use(Tus, {
+        endpoint: `https://${SUPABASE_PROJECT_ID}.supabase.co/storage/v1/upload/resumable`,
+        headers: {
+          authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          apikey: SUPABASE_ANON_KEY,
+        },
+        uploadDataDuringCreation: true,
+        chunkSize: 6 * 1024 * 1024,
+        allowedMetaFields: ['bucketName', 'objectName', 'contentType'],
+        onError: function (error) {
+          console.error('Uppy upload failed:', error);
+          setIsUploading(false);
+        },
+      });
+
+    uppyRef.current.on('file-added', (file) => {
+      const supabaseMetadata = {
+        bucketName: STORAGE_BUCKET,
+        objectName: `event_photos/${new Date().getTime()}-${file.name}`,
+        contentType: file.type,
+      };
+
+      file.meta = {
+        ...file.meta,
+        ...supabaseMetadata,
+      };
+      setIsUploading(true);
+      console.log('File added for upload:', file);
+    });
+
+    uppyRef.current.on('complete', (result) => {
+      console.log('Upload complete!', result.successful);
+      if (result.successful.length > 0) {
+        const filePath = result.successful[0].uploadURL.split('/').pop();
+        const publicUrl = `https://${SUPABASE_PROJECT_ID}.supabase.co/storage/v1/object/public/${STORAGE_BUCKET}/${filePath}`;
+        setUploadedImageUrl(publicUrl);
+        setIsUploading(false);
+      } else {
+        setIsUploading(false);
+      }
+    });
+
+    return () => {
+      uppyRef.current.close();
+    };
+  }, [SUPABASE_PROJECT_ID, SUPABASE_ANON_KEY, STORAGE_BUCKET]);
+
+  // Função para adicionar um novo post
+  const addPost = async (e) => {
+    e.preventDefault();
+    if (!fact && !videoUrl && !uploadedImageUrl) return;
+
+    if (!supabase) {
+        console.error("Supabase client not initialized.");
+        return;
+    }
+
+    const videoId = getYouTubeId(videoUrl);
+
+    const postData = {
+      fact: fact,
+      video_url: videoId ? `https://www.youtube.com/embed/${videoId}` : null,
+      image_url: uploadedImageUrl,
+    };
+
+    try {
+      const { data, error } = await supabase
+        .from('event_posts')
+        .insert([postData]);
+
+      if (error) {
+        console.error("Error adding post:", error);
+      } else {
+        console.log("Post successfully added!", data);
+        setFact('');
+        setVideoUrl('');
+        setUploadedImageUrl(null); // Limpa o URL da imagem
+        uppyRef.current.reset(); // Limpa o Uppy
+      }
+    } catch (e) {
+      console.error("Error adding post: ", e);
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-100">
+        <div className="text-xl text-gray-700">Carregando...</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-gradient-to-br from-indigo-100 to-fuchsia-100 min-h-screen text-gray-800 font-sans">
+      <div className="container mx-auto p-4 md:p-8">
+        {/* Header da aplicação */}
+        <header className="text-center mb-8">
+          <h1 className="text-4xl md:text-6xl font-extrabold text-indigo-800 leading-tight">
+            Nosso Dia Especial
+          </h1>
+          <p className="text-lg md:text-xl text-gray-600 mt-2">
+            Compartilhe um vídeo, uma foto ou um fato memorável!
+          </p>
+        </header>
+
+        {/* Seção do QR Code */}
+        <section className="bg-white p-6 rounded-3xl shadow-xl max-w-lg mx-auto mb-8">
+          <h2 className="text-2xl font-bold text-center text-indigo-700 mb-4">
+            Aponte a câmera para compartilhar!
+          </h2>
+          <div className="flex justify-center mb-4">
+            {qrCodeData && generateQRCodeSVG(qrCodeData)}
+          </div>
+        </section>
+
+        {/* Formulário de submissão */}
+        <section className="bg-white p-6 rounded-3xl shadow-xl max-w-lg mx-auto mb-8">
+          <h2 className="text-2xl font-bold text-center text-indigo-700 mb-4">
+            Deixe sua contribuição!
+          </h2>
+          <form onSubmit={addPost} className="space-y-4">
+            <div>
+              <label htmlFor="fact" className="block text-sm font-medium text-gray-700">
+                Conte um fato divertido:
+              </label>
+              <textarea
+                id="fact"
+                value={fact}
+                onChange={(e) => setFact(e.target.value)}
+                className="mt-1 block w-full rounded-xl border-gray-300 shadow-sm p-3 focus:ring-fuchsia-500 focus:border-fuchsia-500 transition duration-300"
+                rows="3"
+                placeholder="Ex: 'O noivo quase caiu na hora de dançar!'"
+              ></textarea>
+            </div>
+            <div>
+              <label htmlFor="videoUrl" className="block text-sm font-medium text-gray-700">
+                URL do vídeo do YouTube:
+              </label>
+              <input
+                type="url"
+                id="videoUrl"
+                value={videoUrl}
+                onChange={(e) => setVideoUrl(e.target.value)}
+                className="mt-1 block w-full rounded-xl border-gray-300 shadow-sm p-3 focus:ring-fuchsia-500 focus:border-fuchsia-500 transition duration-300"
+                placeholder="Ex: https://www.youtube.com/watch?v=..."
+              />
+            </div>
+            {/* Div para o dashboard Uppy */}
+            <div id="uppy-dashboard" ref={dashboardRef}></div>
+            <button
+              type="submit"
+              className="w-full bg-gradient-to-r from-indigo-500 to-fuchsia-500 text-white font-bold py-3 px-6 rounded-xl shadow-lg hover:from-indigo-600 hover:to-fuchsia-600 transition duration-300 transform hover:scale-105 disabled:opacity-50"
+              disabled={isUploading || (!fact && !videoUrl && !uploadedImageUrl)}
+            >
+              {isUploading ? 'Carregando foto...' : 'Compartilhar'}
+            </button>
+          </form>
+        </section>
+
+        {/* Galeria de posts */}
+        <section className="mt-12">
+          <h2 className="text-3xl font-bold text-center text-indigo-800 mb-6">
+            Galeria de Momentos
+          </h2>
+          {posts.length === 0 ? (
+            <p className="text-center text-gray-500 text-lg">
+              Ainda não há posts. Seja o primeiro a compartilhar!
+            </p>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+              {posts.map((post) => (
+                <div key={post.id} className="bg-white rounded-3xl shadow-lg p-6 flex flex-col items-center transform transition duration-300 hover:scale-105 hover:shadow-2xl">
+                  {post.image_url && (
+                    <div className="w-full rounded-2xl overflow-hidden shadow-md mb-4">
+                      <img
+                        src={post.image_url}
+                        alt="Foto do evento"
+                        className="w-full h-auto object-cover"
+                      />
+                    </div>
+                  )}
+                  {post.video_url && (
+                    <div className="w-full aspect-video rounded-2xl overflow-hidden shadow-md mb-4">
+                      <iframe
+                        className="w-full h-full"
+                        src={post.video_url}
+                        frameBorder="0"
+                        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                        allowFullScreen
+                        title="Vídeo do YouTube"
+                        onError={(e) => {
+                            e.target.src = fallbackVideoUrl;
+                            e.target.title = "Vídeo não disponível. Exibindo um placeholder.";
+                        }}
+                      ></iframe>
+                    </div>
+                  )}
+                  {post.fact && (
+                    <blockquote className="text-center text-gray-700 italic text-lg leading-relaxed mt-auto">
+                      "{post.fact}"
+                    </blockquote>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+};
+
+export default App;
